@@ -1,7 +1,11 @@
 {"Name":"Contoh","Axes":[
-{"Joy":0,"Axis":"X","SimEvent":"AXIS_AILERONS_SET","Invert":false,"Deadzone":2},
-{"Joy":0,"Axis":"Y","SimEvent":"AXIS_ELEVATOR_SET","Invert":false,"Deadzone":2},
-{"Joy":0,"Axis":"Z","SimEvent":"AXIS_THROTTLE_SET","Invert":true,"Deadzone":0}],
+{"Joy":0,"Axis":"X","SimEvent":"AXIS_AILERONS_SET","Invert":false,"Deadzone":2,"Min":0,"Max":1},
+{"Joy":0,"Axis":"Y","SimEvent":"AXIS_ELEVATOR_SET","Invert":false,"Deadzone":2,"Min":0,"Max":1},
+{"Joy":0,"Axis":"Z","SimEvent":"AXIS_THROTTLE_SET","Invert":true,"Deadzone":0,"Min":0,"Max":1},
+{"Joy":0,"Axis":"U","SimEvent":"L:CONTOH_KNOB_BRIGHTNESS","Invert":false,"Deadzone":0,"Min":0,"Max":1}],
 "Buttons":[
-{"Joy":0,"Button":1,"SimEvent":"GEAR_TOGGLE","Param":0,"Trigger":"Press"},
-{"Joy":0,"Button":2,"SimEvent":"FLAPS_INCR","Param":0,"Trigger":"Press"}]}
+{"Joy":0,"Button":1,"Action":"Event","SimEvent":"GEAR_TOGGLE","Value":0,"ValueOff":0,"Trigger":"Press"},
+{"Joy":0,"Button":2,"Action":"Event","SimEvent":"FLAPS_INCR","Value":0,"ValueOff":0,"Trigger":"Press"},
+{"Joy":0,"Button":3,"Action":"LVarSet","SimEvent":"L:CONTOH_SWITCH_BATT","Value":1,"ValueOff":0,"Trigger":"Both"},
+{"Joy":0,"Button":4,"Action":"LVarToggle","SimEvent":"L:CONTOH_SWITCH_LIGHT","Value":1,"ValueOff":0,"Trigger":"Press"},
+{"Joy":0,"Button":5,"Action":"SimVarSet","SimEvent":"LIGHT NAV,bool","Value":1,"ValueOff":0,"Trigger":"Both"}]}
