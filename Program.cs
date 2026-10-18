@@ -87,6 +87,15 @@ namespace AxisClone
         enum GRP { G1 }
         enum DEF { }
 
+        enum LearnMode { None, Axis, Button }
+        LearnMode learn = LearnMode.None;
+        readonly Dictionary<string, uint> learnBase = new Dictionary<string, uint>();
+        readonly AutoCompleteStringCollection eventSource = new AutoCompleteStringCollection();
+        CheckBox chkAuto;
+        Timer autoTimer;
+        string lastPresetPath = "";
+        bool loadingSettings;
+
         SimConnect sc;
         readonly Dictionary<string, int> evIds = new Dictionary<string, int>();
         readonly Dictionary<string, int> defIds = new Dictionary<string, int>();
@@ -108,9 +117,14 @@ namespace AxisClone
 
             var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40 };
             top.Controls.Add(MakeBtn("Connect P3D", (s, e) => Connect()));
-            top.Controls.Add(MakeBtn("Disconnect", (s, e) => Disconnect()));
+            top.Controls.Add(MakeBtn("Disconnect", (s, e) => { chkAuto.Checked = false; Disconnect(); }));
             top.Controls.Add(MakeBtn("Load Preset", (s, e) => LoadPreset()));
             top.Controls.Add(MakeBtn("Save Preset", (s, e) => SavePreset()));
+            top.Controls.Add(MakeBtn("Learn Axis", (s, e) => StartLearn(LearnMode.Axis)));
+            top.Controls.Add(MakeBtn("Learn Button", (s, e) => StartLearn(LearnMode.Button)));
+            chkAuto = new CheckBox { Text = "Auto-connect", Checked = true, AutoSize = true, Padding = new Padding(8, 6, 0, 0) };
+            chkAuto.CheckedChanged += (s, e) => SaveSettings();
+            top.Controls.Add(chkAuto);
             status = new Label { Text = "Disconnected", AutoSize = true, Padding = new Padding(10, 8, 0, 0) };
             top.Controls.Add(status);
 
@@ -119,6 +133,9 @@ namespace AxisClone
             MakeCombo(gridA, "Axis", "X", "Y", "Z", "R", "U", "V");
             MakeCombo(gridB, "Action", "Event", "LVarSet", "LVarToggle", "SimVarSet");
             MakeCombo(gridB, "Trigger", "Press", "Release", "Both");
+            eventSource.AddRange(EventList.All);
+            HookAutocomplete(gridA);
+            HookAutocomplete(gridB);
 
             var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal };
             split.Panel1.Controls.Add(gridA);
@@ -132,6 +149,12 @@ namespace AxisClone
             poll = new Timer { Interval = 20 };
             poll.Tick += (s, e) => Poll();
             poll.Start();
+
+            autoTimer = new Timer { Interval = 3000 };
+            autoTimer.Tick += (s, e) => { if (chkAuto.Checked && sc == null) Connect(); };
+            autoTimer.Start();
+
+            LoadSettings();
         }
 
         static void MakeCombo(DataGridView g, string prop, params string[] items)
@@ -159,12 +182,12 @@ namespace AxisClone
             {
                 sc = new SimConnect("AxisClone", Handle, WM_USER_SIMCONNECT, null, 0);
                 sc.OnRecvOpen += (s, d) => status.Text = "Connected";
-                sc.OnRecvQuit += (s, d) => Disconnect();
+                sc.OnRecvQuit += (s, d) => BeginInvoke(new Action(Disconnect));
                 sc.SetNotificationGroupPriority(GRP.G1, SimConnect.SIMCONNECT_GROUP_PRIORITY_HIGHEST);
                 evIds.Clear(); defIds.Clear();
                 status.Text = "Connecting...";
             }
-            catch (Exception ex) { status.Text = "Gagal: " + ex.Message; sc = null; }
+            catch (Exception ex) { status.Text = "Menunggu P3D... (" + ex.Message + ")"; sc = null; }
         }
 
         void Disconnect()
@@ -280,6 +303,7 @@ namespace AxisClone
         // ----- Polling joystick -----
         void Poll()
         {
+            if (learn != LearnMode.None) { DoLearn(); return; }
             if (sc == null) return;
 
             foreach (var a in axes.ToList())
@@ -324,13 +348,24 @@ namespace AxisClone
             using (var d = new OpenFileDialog { Filter = "Preset (*.json)|*.json" })
             {
                 if (d.ShowDialog() != DialogResult.OK) return;
-                using (var fs = File.OpenRead(d.FileName))
+                LoadPresetFile(d.FileName);
+            }
+        }
+
+        void LoadPresetFile(string path)
+        {
+            try
+            {
+                using (var fs = File.OpenRead(path))
                     preset = (Preset)new DataContractJsonSerializer(typeof(Preset)).ReadObject(fs);
                 axes.Clear(); buttons.Clear(); lastAxis.Clear(); toggleState.Clear();
                 foreach (var a in preset.Axes) axes.Add(a);
                 foreach (var b in preset.Buttons) buttons.Add(b);
                 Text = "Axis Clone - " + preset.Name;
+                lastPresetPath = path;
+                SaveSettings();
             }
+            catch (Exception ex) { MessageBox.Show("Gagal load preset: " + ex.Message); }
         }
 
         void SavePreset()
@@ -342,7 +377,122 @@ namespace AxisClone
                 preset.Axes = axes.ToList(); preset.Buttons = buttons.ToList();
                 using (var fs = File.Create(d.FileName))
                     new DataContractJsonSerializer(typeof(Preset)).WriteObject(fs, preset);
+                lastPresetPath = d.FileName; SaveSettings();
             }
+        }
+
+        // ----- Learn: deteksi axis / tombol otomatis -----
+        void StartLearn(LearnMode m)
+        {
+            learn = m; learnBase.Clear();
+            status.Text = m == LearnMode.Axis ? "LEARN: gerakkan sebuah axis..." : "LEARN: tekan sebuah tombol...";
+        }
+
+        void DoLearn()
+        {
+            string[] names = { "X", "Y", "Z", "R", "U", "V" };
+            for (int id = 0; id < 16; id++)
+            {
+                if (!Joy.Read(id, out var j)) continue;
+                if (learn == LearnMode.Axis)
+                {
+                    foreach (var n in names)
+                    {
+                        string key = id + n;
+                        uint v = Joy.GetAxis(j, n);
+                        if (!learnBase.TryGetValue(key, out uint b0)) { learnBase[key] = v; continue; }
+                        if (Math.Abs((int)v - (int)b0) > 12000)
+                        {
+                            axes.Add(new AxisMap { Joy = id, Axis = n, SimEvent = "" });
+                            FinishLearn(gridA); return;
+                        }
+                    }
+                }
+                else
+                {
+                    string key = id + "B";
+                    if (!learnBase.TryGetValue(key, out uint b0)) { learnBase[key] = j.dwButtons; continue; }
+                    uint pressed = j.dwButtons & ~b0;
+                    if (pressed != 0)
+                    {
+                        int bit = 0; while ((pressed & (1u << bit)) == 0) bit++;
+                        buttons.Add(new ButtonMap { Joy = id, Button = bit + 1, SimEvent = "" });
+                        FinishLearn(gridB); return;
+                    }
+                    learnBase[key] = b0 & j.dwButtons; // tombol yang dilepas boleh terdeteksi lagi
+                }
+            }
+        }
+
+        void FinishLearn(DataGridView g)
+        {
+            learn = LearnMode.None;
+            status.Text = sc == null ? "Disconnected" : "Connected";
+            try
+            {
+                int r = g.Rows.Count - 2; // baris terakhir sebelum baris 'new'
+                if (r >= 0) { g.CurrentCell = g.Rows[r].Cells["SimEvent"]; g.Focus(); }
+            }
+            catch { }
+            // reset state tombol agar tidak langsung memicu aksi
+            lastButtons.Clear();
+        }
+
+        // ----- Autocomplete nama event -----
+        void HookAutocomplete(DataGridView g)
+        {
+            g.EditingControlShowing += (s, e) =>
+            {
+                var tb = e.Control as TextBox;
+                if (tb == null) return;
+                bool isTarget = g.CurrentCell != null &&
+                    g.Columns[g.CurrentCell.ColumnIndex].DataPropertyName == "SimEvent";
+                if (isTarget)
+                {
+                    tb.AutoCompleteMode = AutoCompleteMode.Suggest;
+                    tb.AutoCompleteSource = AutoCompleteSource.CustomSource;
+                    tb.AutoCompleteCustomSource = eventSource;
+                }
+                else tb.AutoCompleteMode = AutoCompleteMode.None;
+            };
+        }
+
+        // ----- Settings (preset terakhir + auto-connect) -----
+        static string SettingsPath
+        {
+            get
+            {
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "AxisClone", "settings.txt");
+            }
+        }
+
+        void SaveSettings()
+        {
+            if (loadingSettings) return;
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath));
+                File.WriteAllLines(SettingsPath, new[] { chkAuto.Checked ? "1" : "0", lastPresetPath ?? "" });
+            }
+            catch { }
+        }
+
+        void LoadSettings()
+        {
+            loadingSettings = true;
+            try
+            {
+                if (File.Exists(SettingsPath))
+                {
+                    var l = File.ReadAllLines(SettingsPath);
+                    if (l.Length > 0) chkAuto.Checked = l[0] == "1";
+                    loadingSettings = false;
+                    if (l.Length > 1 && File.Exists(l[1])) LoadPresetFile(l[1]);
+                }
+            }
+            catch { }
+            finally { loadingSettings = false; }
         }
 
         [STAThread]
