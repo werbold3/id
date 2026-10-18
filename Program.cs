@@ -26,6 +26,14 @@ namespace AxisClone
         [DataMember] public int Deadzone { get; set; } = 2;
         [DataMember] public double Min { get; set; } = 0;   // dipakai hanya untuk target L:/SimVar
         [DataMember] public double Max { get; set; } = 1;
+        public string Live { get; set; }   // monitor (tidak disimpan)
+
+        [OnDeserialized]
+        void Fix(StreamingContext c)
+        {
+            if (Axis == null) Axis = "X";
+            if (SimEvent == null) SimEvent = "";
+        }
     }
 
     [DataContract]
@@ -40,6 +48,15 @@ namespace AxisClone
         [DataMember] public double ValueOff { get; set; }     // nilai saat Release (Both) / posisi OFF (Toggle)
         // Press | Release | Both
         [DataMember] public string Trigger { get; set; } = "Press";
+        public string State { get; set; }  // monitor (tidak disimpan)
+
+        [OnDeserialized]
+        void Fix(StreamingContext c)
+        {
+            if (Action == null) Action = "Event";
+            if (SimEvent == null) SimEvent = "";
+            if (Trigger == null) Trigger = "Press";
+        }
     }
 
     [DataContract]
@@ -48,7 +65,27 @@ namespace AxisClone
         [DataMember] public string Name { get; set; } = "New Preset";
         [DataMember] public List<AxisMap> Axes { get; set; } = new List<AxisMap>();
         [DataMember] public List<ButtonMap> Buttons { get; set; } = new List<ButtonMap>();
+        // Potongan nama pesawat (dipisah koma) untuk pergantian profil otomatis, mis: F-16,Viper
+        [DataMember] public string AircraftMatch { get; set; } = "";
+
+        [OnDeserialized]
+        void Fix(StreamingContext c)
+        {
+            if (Axes == null) Axes = new List<AxisMap>();
+            if (Buttons == null) Buttons = new List<ButtonMap>();
+            if (AircraftMatch == null) AircraftMatch = "";
+            if (Name == null) Name = "Preset";
+        }
     }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi, Pack = 1)]
+    struct TitleStruct
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string Title;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    struct DoubleStruct { public double V; }
 
     // ---------- Joystick (winmm) ----------
     static class Joy
@@ -96,6 +133,18 @@ namespace AxisClone
         string lastPresetPath = "";
         bool loadingSettings;
 
+        enum REQ { }
+        const int TITLE_ID = 9000;
+        readonly Dictionary<string, int> readIds = new Dictionary<string, int>();
+        readonly Dictionary<int, List<ButtonMap>> readButtons = new Dictionary<int, List<ButtonMap>>();
+        Label lblAircraft;
+        TextBox txtMatch;
+        CheckBox chkProfile;
+        string profileFolder = "";
+        string currentTitle = "";
+        bool opened;
+        int tick;
+
         SimConnect sc;
         readonly Dictionary<string, int> evIds = new Dictionary<string, int>();
         readonly Dictionary<string, int> defIds = new Dictionary<string, int>();
@@ -133,6 +182,8 @@ namespace AxisClone
             MakeCombo(gridA, "Axis", "X", "Y", "Z", "R", "U", "V");
             MakeCombo(gridB, "Action", "Event", "LVarSet", "LVarToggle", "SimVarSet");
             MakeCombo(gridB, "Trigger", "Press", "Release", "Both");
+            if (gridA.Columns.Contains("Live")) gridA.Columns["Live"].ReadOnly = true;
+            if (gridB.Columns.Contains("State")) gridB.Columns["State"].ReadOnly = true;
             eventSource.AddRange(EventList.All);
             HookAutocomplete(gridA);
             HookAutocomplete(gridB);
@@ -143,7 +194,19 @@ namespace AxisClone
             split.Panel2.Controls.Add(gridB);
             split.Panel2.Controls.Add(new Label { Text = "BUTTONS / SWITCHES  (Both = Press kirim Value, Release kirim ValueOff)", Dock = DockStyle.Top, Height = 18 });
 
+            var top2 = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 34 };
+            top2.Controls.Add(new Label { Text = "Aircraft match:", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
+            txtMatch = new TextBox { Width = 220 };
+            top2.Controls.Add(txtMatch);
+            chkProfile = new CheckBox { Text = "Auto profile", AutoSize = true, Padding = new Padding(8, 4, 0, 0) };
+            chkProfile.CheckedChanged += (s, e) => SaveSettings();
+            top2.Controls.Add(chkProfile);
+            top2.Controls.Add(MakeBtn("Profile folder...", (s, e) => PickProfileFolder()));
+            lblAircraft = new Label { Text = "Aircraft: -", AutoSize = true, Padding = new Padding(10, 6, 0, 0) };
+            top2.Controls.Add(lblAircraft);
+
             Controls.Add(split);
+            Controls.Add(top2);
             Controls.Add(top);
 
             poll = new Timer { Interval = 20 };
@@ -181,7 +244,8 @@ namespace AxisClone
             try
             {
                 sc = new SimConnect("AxisClone", Handle, WM_USER_SIMCONNECT, null, 0);
-                sc.OnRecvOpen += (s, d) => status.Text = "Connected";
+                sc.OnRecvOpen += (s, d) => { status.Text = "Connected"; OnOpened(); };
+                sc.OnRecvSimobjectData += OnSimData;
                 sc.OnRecvQuit += (s, d) => BeginInvoke(new Action(Disconnect));
                 sc.SetNotificationGroupPriority(GRP.G1, SimConnect.SIMCONNECT_GROUP_PRIORITY_HIGHEST);
                 evIds.Clear(); defIds.Clear();
@@ -194,6 +258,8 @@ namespace AxisClone
         {
             try { sc?.Dispose(); } catch { }
             sc = null; evIds.Clear(); defIds.Clear();
+            readIds.Clear(); readButtons.Clear(); opened = false; currentTitle = "";
+            if (lblAircraft != null) lblAircraft.Text = "Aircraft: -";
             status.Text = "Disconnected";
         }
 
@@ -304,15 +370,16 @@ namespace AxisClone
         void Poll()
         {
             if (learn != LearnMode.None) { DoLearn(); return; }
-            if (sc == null) return;
 
             foreach (var a in axes.ToList())
             {
-                if (!Joy.Read(a.Joy, out var j)) continue;
+                if (!Joy.Read(a.Joy, out var j)) { a.Live = "n/a"; continue; }
                 double v = (Joy.GetAxis(j, a.Axis) - 32767.5) / 32767.5; // -1..1
                 if (a.Invert) v = -v;
                 if (Math.Abs(v) * 100 < a.Deadzone) v = 0;
+                a.Live = Math.Round(v * 100).ToString("0") + "%";
 
+                if (sc == null) continue;
                 double outVal = IsVarTarget(a.SimEvent)
                     ? Math.Round(a.Min + (v + 1) / 2 * (a.Max - a.Min), 4)
                     : Math.Round(v * 16383);
@@ -331,15 +398,19 @@ namespace AxisClone
 
             foreach (var b in buttons.ToList())
             {
-                if (!current.TryGetValue(b.Joy, out uint now32)) continue;
-                lastButtons.TryGetValue(b.Joy, out uint prev);
+                if (!current.TryGetValue(b.Joy, out uint now32)) { b.State = "n/a"; continue; }
                 if (b.Button < 1 || b.Button > 32) continue;
+                lastButtons.TryGetValue(b.Joy, out uint prev);
                 uint mask = 1u << (b.Button - 1);
                 bool now = (now32 & mask) != 0, was = (prev & mask) != 0;
+                b.State = now ? "ON" : "";
+                if (sc == null) continue;
                 if (now && !was) Fire(b, true);
                 else if (!now && was) Fire(b, false);
             }
             foreach (var kv in current) lastButtons[kv.Key] = kv.Value;
+
+            if (++tick % 4 == 0) { gridA.Invalidate(); gridB.Invalidate(); }
         }
 
         // ----- Preset -----
@@ -362,8 +433,10 @@ namespace AxisClone
                 foreach (var a in preset.Axes) axes.Add(a);
                 foreach (var b in preset.Buttons) buttons.Add(b);
                 Text = "Axis Clone - " + preset.Name;
+                txtMatch.Text = preset.AircraftMatch ?? "";
                 lastPresetPath = path;
                 SaveSettings();
+                SyncToggles();
             }
             catch (Exception ex) { MessageBox.Show("Gagal load preset: " + ex.Message); }
         }
@@ -374,6 +447,7 @@ namespace AxisClone
             {
                 if (d.ShowDialog() != DialogResult.OK) return;
                 preset.Name = Path.GetFileNameWithoutExtension(d.FileName);
+                preset.AircraftMatch = txtMatch.Text.Trim();
                 preset.Axes = axes.ToList(); preset.Buttons = buttons.ToList();
                 using (var fs = File.Create(d.FileName))
                     new DataContractJsonSerializer(typeof(Preset)).WriteObject(fs, preset);
@@ -473,7 +547,7 @@ namespace AxisClone
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath));
-                File.WriteAllLines(SettingsPath, new[] { chkAuto.Checked ? "1" : "0", lastPresetPath ?? "" });
+                File.WriteAllLines(SettingsPath, new[] { chkAuto.Checked ? "1" : "0", lastPresetPath ?? "", profileFolder ?? "", chkProfile.Checked ? "1" : "0" });
             }
             catch { }
         }
@@ -487,12 +561,128 @@ namespace AxisClone
                 {
                     var l = File.ReadAllLines(SettingsPath);
                     if (l.Length > 0) chkAuto.Checked = l[0] == "1";
+                    if (l.Length > 2) profileFolder = l[2];
+                    if (l.Length > 3) chkProfile.Checked = l[3] == "1";
                     loadingSettings = false;
                     if (l.Length > 1 && File.Exists(l[1])) LoadPresetFile(l[1]);
                 }
             }
             catch { }
             finally { loadingSettings = false; }
+        }
+
+        // ----- Baca data dari sim: judul pesawat + status LVar untuk toggle -----
+        void OnOpened()
+        {
+            opened = true;
+            try
+            {
+                sc.AddToDataDefinition((DEF)TITLE_ID, "TITLE", null,
+                    SIMCONNECT_DATATYPE.STRING256, 0f, SimConnect.SIMCONNECT_UNUSED);
+                sc.RegisterDataDefineStruct<TitleStruct>((DEF)TITLE_ID);
+                sc.RequestDataOnSimObject((REQ)TITLE_ID, (DEF)TITLE_ID,
+                    SimConnect.SIMCONNECT_OBJECT_ID_USER, SIMCONNECT_PERIOD.SECOND,
+                    SIMCONNECT_DATA_REQUEST_FLAG.CHANGED, 0, 0, 0);
+            }
+            catch (Exception ex) { status.Text = "Err title: " + ex.Message; }
+            SyncToggles();
+        }
+
+        static string LName(string t)
+        {
+            t = (t ?? "").Trim();
+            return t.StartsWith("L:", StringComparison.OrdinalIgnoreCase) ? t.Substring(2).Trim() : t;
+        }
+
+        // Baca nilai LVar untuk tiap tombol LVarToggle supaya posisi toggle sinkron dengan kokpit
+        void SyncToggles()
+        {
+            if (sc == null || !opened) return;
+            try
+            {
+                foreach (var l in readButtons.Values) l.Clear();
+                foreach (var b in buttons.Where(x => x.Action == "LVarToggle" && !string.IsNullOrWhiteSpace(x.SimEvent)))
+                {
+                    string name = LName(b.SimEvent);
+                    if (!readIds.TryGetValue(name, out int id))
+                    {
+                        id = 10001 + readIds.Count;
+                        sc.AddToDataDefinition((DEF)id, "L:" + name, "number",
+                            SIMCONNECT_DATATYPE.FLOAT64, 0f, SimConnect.SIMCONNECT_UNUSED);
+                        sc.RegisterDataDefineStruct<DoubleStruct>((DEF)id);
+                        sc.RequestDataOnSimObject((REQ)id, (DEF)id,
+                            SimConnect.SIMCONNECT_OBJECT_ID_USER, SIMCONNECT_PERIOD.SECOND,
+                            SIMCONNECT_DATA_REQUEST_FLAG.CHANGED, 0, 0, 0);
+                        readIds[name] = id;
+                        readButtons[id] = new List<ButtonMap>();
+                    }
+                    readButtons[id].Add(b);
+                }
+            }
+            catch (Exception ex) { status.Text = "Err sync: " + ex.Message; }
+        }
+
+        void OnSimData(SimConnect sender, SIMCONNECT_RECV_SIMOBJECT_DATA data)
+        {
+            try
+            {
+                int rid = (int)data.dwRequestID;
+                if (rid == TITLE_ID)
+                {
+                    string t = ((TitleStruct)data.dwData[0]).Title ?? "";
+                    if (t != currentTitle) { currentTitle = t; OnAircraftChanged(t); }
+                }
+                else if (readButtons.TryGetValue(rid, out var list))
+                {
+                    double v = ((DoubleStruct)data.dwData[0]).V;
+                    foreach (var b in list)
+                        toggleState[b] = Math.Abs(v - b.Value) <= Math.Abs(v - b.ValueOff);
+                }
+            }
+            catch { }
+        }
+
+        // ----- Pergantian profil otomatis per pesawat -----
+        void OnAircraftChanged(string title)
+        {
+            lblAircraft.Text = "Aircraft: " + title;
+            if (!chkProfile.Checked || string.IsNullOrWhiteSpace(profileFolder) || !Directory.Exists(profileFolder)) return;
+
+            foreach (var file in Directory.GetFiles(profileFolder, "*.json"))
+            {
+                try
+                {
+                    Preset p;
+                    using (var fs = File.OpenRead(file))
+                        p = (Preset)new DataContractJsonSerializer(typeof(Preset)).ReadObject(fs);
+                    if (string.IsNullOrWhiteSpace(p.AircraftMatch)) continue;
+
+                    bool match = p.AircraftMatch.Split(',')
+                        .Select(x => x.Trim()).Where(x => x.Length > 0)
+                        .Any(x => title.IndexOf(x, StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (!match) continue;
+
+                    if (!string.Equals(file, lastPresetPath, StringComparison.OrdinalIgnoreCase))
+                        LoadPresetFile(file);
+                    status.Text = "Connected - profil: " + p.Name;
+                    return;
+                }
+                catch { }
+            }
+        }
+
+        void PickProfileFolder()
+        {
+            using (var d = new FolderBrowserDialog { Description = "Pilih folder berisi preset (.json)" })
+            {
+                if (!string.IsNullOrEmpty(profileFolder) && Directory.Exists(profileFolder))
+                    d.SelectedPath = profileFolder;
+                if (d.ShowDialog() != DialogResult.OK) return;
+                profileFolder = d.SelectedPath;
+                chkProfile.Checked = true;
+                SaveSettings();
+                if (!string.IsNullOrEmpty(currentTitle)) OnAircraftChanged(currentTitle);
+            }
         }
 
         [STAThread]
