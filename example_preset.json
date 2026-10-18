@@ -1,0 +1,7 @@
+{"Name":"Contoh","Axes":[
+{"Joy":0,"Axis":"X","SimEvent":"AXIS_AILERONS_SET","Invert":false,"Deadzone":2},
+{"Joy":0,"Axis":"Y","SimEvent":"AXIS_ELEVATOR_SET","Invert":false,"Deadzone":2},
+{"Joy":0,"Axis":"Z","SimEvent":"AXIS_THROTTLE_SET","Invert":true,"Deadzone":0}],
+"Buttons":[
+{"Joy":0,"Button":1,"SimEvent":"GEAR_TOGGLE","Param":0,"Trigger":"Press"},
+{"Joy":0,"Button":2,"SimEvent":"FLAPS_INCR","Param":0,"Trigger":"Press"}]}

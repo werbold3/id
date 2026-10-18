@@ -1,0 +1,50 @@
+name: Build AxisClone
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Cek DLL SimConnect
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "lib/LockheedMartin.Prepar3D.SimConnect.dll")) {
+            Write-Error "lib/LockheedMartin.Prepar3D.SimConnect.dll tidak ditemukan. Salin dari P3D SDK 4.5 ke folder lib/ lalu commit."
+            exit 1
+          }
+
+      - name: Restore
+        run: dotnet restore AxisClone.csproj
+
+      - name: Build (Release x64)
+        run: dotnet build AxisClone.csproj -c Release --no-restore -o out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AxisClone-win-x64
+          path: out/
+
+      - name: Zip untuk release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: Compress-Archive -Path out/* -DestinationPath AxisClone.zip
+
+      - name: Buat GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AxisClone.zip

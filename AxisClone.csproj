@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>AxisClone</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Runtime.Serialization" />
+    <!-- Taruh DLL dari P3D SDK 4.5 di folder lib/ (lihat README_BUILD.txt) -->
+    <Reference Include="LockheedMartin.Prepar3D.SimConnect">
+      <HintPath>lib\LockheedMartin.Prepar3D.SimConnect.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <None Include="lib\SimConnect.dll" Condition="Exists('lib\SimConnect.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="example_preset.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+</Project>
