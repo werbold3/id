@@ -8,7 +8,12 @@
     <AssemblyName>AxisClone</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="SharpDX.DirectInput" Version="4.2.0" />
+  </ItemGroup>
+  <ItemGroup>
     <Reference Include="System.Runtime.Serialization" />
+    <Reference Include="System.Xml" />
+    <Reference Include="System.Xml.Linq" />
     <!-- Taruh DLL dari P3D SDK 4.5 di folder lib/ (lihat README_BUILD.txt) -->
     <Reference Include="LockheedMartin.Prepar3D.SimConnect">
       <HintPath>lib\LockheedMartin.Prepar3D.SimConnect.dll</HintPath>

@@ -6,116 +6,12 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
+using System.Drawing;
 using System.Windows.Forms;
 using LockheedMartin.Prepar3D.SimConnect;
 
 namespace AxisClone
 {
-    // ---------- Model preset ----------
-    // SimEvent / Target bisa berisi:
-    //   NAMA_EVENT_P3D            -> kirim event (mis. GEAR_TOGGLE, AXIS_ELEVATOR_SET)
-    //   L:namaLvar                -> set Local Variable (mis. L:SWITCH_BATT)
-    //   NAMA SIMVAR,units         -> set SimVar yang bisa ditulis (mis. LIGHT NAV,bool)
-    [DataContract]
-    public class AxisMap
-    {
-        [DataMember] public int Joy { get; set; }
-        [DataMember] public string Axis { get; set; } = "X";
-        [DataMember] public string SimEvent { get; set; } = "AXIS_ELEVATOR_SET";
-        [DataMember] public bool Invert { get; set; }
-        [DataMember] public int Deadzone { get; set; } = 2;
-        [DataMember] public double Min { get; set; } = 0;   // dipakai hanya untuk target L:/SimVar
-        [DataMember] public double Max { get; set; } = 1;
-        public string Live { get; set; }   // monitor (tidak disimpan)
-
-        [OnDeserialized]
-        void Fix(StreamingContext c)
-        {
-            if (Axis == null) Axis = "X";
-            if (SimEvent == null) SimEvent = "";
-        }
-    }
-
-    [DataContract]
-    public class ButtonMap
-    {
-        [DataMember] public int Joy { get; set; }
-        [DataMember] public int Button { get; set; } = 1;
-        // Event | LVarSet | LVarToggle | SimVarSet
-        [DataMember] public string Action { get; set; } = "Event";
-        [DataMember] public string SimEvent { get; set; } = "GEAR_TOGGLE";
-        [DataMember] public double Value { get; set; }        // nilai saat Press (atau param event)
-        [DataMember] public double ValueOff { get; set; }     // nilai saat Release (Both) / posisi OFF (Toggle)
-        // Press | Release | Both
-        [DataMember] public string Trigger { get; set; } = "Press";
-        public string State { get; set; }  // monitor (tidak disimpan)
-
-        [OnDeserialized]
-        void Fix(StreamingContext c)
-        {
-            if (Action == null) Action = "Event";
-            if (SimEvent == null) SimEvent = "";
-            if (Trigger == null) Trigger = "Press";
-        }
-    }
-
-    [DataContract]
-    public class Preset
-    {
-        [DataMember] public string Name { get; set; } = "New Preset";
-        [DataMember] public List<AxisMap> Axes { get; set; } = new List<AxisMap>();
-        [DataMember] public List<ButtonMap> Buttons { get; set; } = new List<ButtonMap>();
-        // Potongan nama pesawat (dipisah koma) untuk pergantian profil otomatis, mis: F-16,Viper
-        [DataMember] public string AircraftMatch { get; set; } = "";
-
-        [OnDeserialized]
-        void Fix(StreamingContext c)
-        {
-            if (Axes == null) Axes = new List<AxisMap>();
-            if (Buttons == null) Buttons = new List<ButtonMap>();
-            if (AircraftMatch == null) AircraftMatch = "";
-            if (Name == null) Name = "Preset";
-        }
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi, Pack = 1)]
-    struct TitleStruct
-    {
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string Title;
-    }
-
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    struct DoubleStruct { public double V; }
-
-    // ---------- Joystick (winmm) ----------
-    static class Joy
-    {
-        [StructLayout(LayoutKind.Sequential)]
-        public struct JOYINFOEX
-        {
-            public uint dwSize, dwFlags, dwXpos, dwYpos, dwZpos, dwRpos, dwUpos, dwVpos,
-                        dwButtons, dwButtonNumber, dwPOV, dwReserved1, dwReserved2;
-        }
-        [DllImport("winmm.dll")] static extern int joyGetPosEx(int id, ref JOYINFOEX info);
-
-        public static bool Read(int id, out JOYINFOEX j)
-        {
-            j = new JOYINFOEX();
-            j.dwSize = (uint)Marshal.SizeOf(typeof(JOYINFOEX));
-            j.dwFlags = 0xFF;
-            return joyGetPosEx(id, ref j) == 0;
-        }
-        public static uint GetAxis(JOYINFOEX j, string a)
-        {
-            switch (a)
-            {
-                case "X": return j.dwXpos; case "Y": return j.dwYpos;
-                case "Z": return j.dwZpos; case "R": return j.dwRpos;
-                case "U": return j.dwUpos; default: return j.dwVpos;
-            }
-        }
-    }
-
     // ---------- Form utama ----------
     public class MainForm : Form
     {
@@ -126,7 +22,8 @@ namespace AxisClone
 
         enum LearnMode { None, Axis, Button }
         LearnMode learn = LearnMode.None;
-        readonly Dictionary<string, uint> learnBase = new Dictionary<string, uint>();
+        readonly Dictionary<string, int> learnAx = new Dictionary<string, int>();
+        readonly Dictionary<Guid, bool[]> learnBtn = new Dictionary<Guid, bool[]>();
         readonly AutoCompleteStringCollection eventSource = new AutoCompleteStringCollection();
         CheckBox chkAuto;
         Timer autoTimer;
@@ -149,7 +46,11 @@ namespace AxisClone
         readonly Dictionary<string, int> evIds = new Dictionary<string, int>();
         readonly Dictionary<string, int> defIds = new Dictionary<string, int>();
         readonly Dictionary<AxisMap, double> lastAxis = new Dictionary<AxisMap, double>();
-        readonly Dictionary<int, uint> lastButtons = new Dictionary<int, uint>();
+        readonly Dictionary<Guid, bool[]> prevBtn = new Dictionary<Guid, bool[]>();
+        readonly Dictionary<string, int> pressTime = new Dictionary<string, int>();
+        readonly Dictionary<ButtonMap, bool> armed = new Dictionary<ButtonMap, bool>();
+        Label lblDevices;
+        int lastDevCount = -1;
         readonly Dictionary<ButtonMap, bool> toggleState = new Dictionary<ButtonMap, bool>();
 
         BindingList<AxisMap> axes = new BindingList<AxisMap>();
@@ -179,9 +80,9 @@ namespace AxisClone
 
             gridA = new DataGridView { Dock = DockStyle.Fill, DataSource = axes, AutoGenerateColumns = true };
             gridB = new DataGridView { Dock = DockStyle.Fill, DataSource = buttons, AutoGenerateColumns = true };
-            MakeCombo(gridA, "Axis", "X", "Y", "Z", "R", "U", "V");
+            MakeCombo(gridA, "Axis", Devices.AxisNames);
             MakeCombo(gridB, "Action", "Event", "LVarSet", "LVarToggle", "SimVarSet");
-            MakeCombo(gridB, "Trigger", "Press", "Release", "Both");
+            MakeCombo(gridB, "Trigger", "Press", "Release", "Both", "ShortClick", "LongClick");
             if (gridA.Columns.Contains("Live")) gridA.Columns["Live"].ReadOnly = true;
             if (gridB.Columns.Contains("State")) gridB.Columns["State"].ReadOnly = true;
             eventSource.AddRange(EventList.All);
@@ -192,7 +93,7 @@ namespace AxisClone
             split.Panel1.Controls.Add(gridA);
             split.Panel1.Controls.Add(new Label { Text = "AXES  (target: EVENT / L:lvar / SIMVAR,units)", Dock = DockStyle.Top, Height = 18 });
             split.Panel2.Controls.Add(gridB);
-            split.Panel2.Controls.Add(new Label { Text = "BUTTONS / SWITCHES  (Both = Press kirim Value, Release kirim ValueOff)", Dock = DockStyle.Top, Height = 18 });
+            split.Panel2.Controls.Add(new Label { Text = "BUTTONS  (Both: Press=Value, Release=ValueOff | Combo = tombol yang harus ditahan | Short/LongClick: batas LongMs)", Dock = DockStyle.Top, Height = 18 });
 
             var top2 = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 34 };
             top2.Controls.Add(new Label { Text = "Aircraft match:", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
@@ -202,6 +103,9 @@ namespace AxisClone
             chkProfile.CheckedChanged += (s, e) => SaveSettings();
             top2.Controls.Add(chkProfile);
             top2.Controls.Add(MakeBtn("Profile folder...", (s, e) => PickProfileFolder()));
+            top2.Controls.Add(MakeBtn("Import Lorby...", (s, e) => ImportLorby()));
+            lblDevices = new Label { Text = "Devices: -", AutoSize = true, Padding = new Padding(10, 6, 0, 0) };
+            top2.Controls.Add(lblDevices);
             lblAircraft = new Label { Text = "Aircraft: -", AutoSize = true, Padding = new Padding(10, 6, 0, 0) };
             top2.Controls.Add(lblAircraft);
 
@@ -333,48 +237,84 @@ namespace AxisClone
         }
 
         // ----- Aksi tombol / switch -----
-        void Fire(ButtonMap b, bool pressed)
+        static bool ShouldFire(ButtonMap b, bool pressed, int held, out bool off)
         {
-            switch (b.Action)
+            off = false;
+            switch (b.Trigger)
             {
-                case "LVarToggle":
-                    if (!pressed) return;
-                    toggleState.TryGetValue(b, out bool on);
-                    on = !on; toggleState[b] = on;
-                    WriteTarget(b.SimEvent.StartsWith("L:", StringComparison.OrdinalIgnoreCase)
-                        ? b.SimEvent : "L:" + b.SimEvent, on ? b.Value : b.ValueOff);
-                    return;
-
-                case "LVarSet":
-                case "SimVarSet":
-                case "Event":
-                default:
-                    double val;
-                    if (pressed && (b.Trigger == "Press" || b.Trigger == "Both")) val = b.Value;
-                    else if (!pressed && b.Trigger == "Release") val = b.Value;
-                    else if (!pressed && b.Trigger == "Both") val = b.ValueOff;
-                    else return;
-
-                    if (b.Action == "LVarSet")
-                        WriteTarget(b.SimEvent.StartsWith("L:", StringComparison.OrdinalIgnoreCase)
-                            ? b.SimEvent : "L:" + b.SimEvent, val);
-                    else if (b.Action == "Event")
-                        SendEvent(b.SimEvent, (int)Math.Round(val));
-                    else
-                        WriteTarget(b.SimEvent, val);
-                    return;
+                case "Release": return !pressed;
+                case "Both": if (!pressed) off = true; return true;
+                case "ShortClick": return !pressed && held < b.LongMs;
+                case "LongClick": return !pressed && held >= b.LongMs;
+                default: return pressed; // Press
             }
         }
 
-        // ----- Polling joystick -----
+        void Fire(ButtonMap b, bool pressed, int held)
+        {
+            if (sc == null) return;
+            if (!ShouldFire(b, pressed, held, out bool off)) return;
+            string tgt = b.SimEvent;
+            double val = off ? b.ValueOff : b.Value;
+            switch (b.Action)
+            {
+                case "LVarToggle":
+                    if (off) return;
+                    toggleState.TryGetValue(b, out bool on);
+                    on = !on; toggleState[b] = on;
+                    WriteTarget("L:" + LName(tgt), on ? b.Value : b.ValueOff);
+                    return;
+                case "LVarSet": WriteTarget("L:" + LName(tgt), val); return;
+                case "Event": SendEvent(tgt, (int)Math.Round(val)); return;
+                default: WriteTarget(tgt, val); return; // SimVarSet
+            }
+        }
+
+        void OnButtonEdge(Dev dev, int btn, bool pressed)
+        {
+            string pk = dev.Guid + ":" + btn;
+            int held = 0;
+            if (pressed) pressTime[pk] = Environment.TickCount;
+            else if (pressTime.TryGetValue(pk, out int t0)) held = unchecked(Environment.TickCount - t0);
+
+            foreach (var b in buttons.ToList())
+            {
+                if (b.Button != btn || Devices.Find(b.JoyName, b.Joy) != dev) continue;
+                if (pressed)
+                {
+                    bool ok = b.Combo <= 0 || (b.Combo - 1 < Dev.BtnCount && dev.Btn[b.Combo - 1]);
+                    armed[b] = ok;
+                    if (ok) Fire(b, true, 0);
+                }
+                else
+                {
+                    if (!armed.TryGetValue(b, out bool wasArmed) || !wasArmed) continue;
+                    armed[b] = false;
+                    Fire(b, false, held);
+                }
+            }
+        }
+
+        // ----- Polling joystick (DirectInput) -----
         void Poll()
         {
+            if (++tick % 100 == 0 && learn == LearnMode.None) Devices.Refresh();
+            Devices.PollAll();
+
+            if (Devices.List.Count != lastDevCount)
+            {
+                lastDevCount = Devices.List.Count;
+                lblDevices.Text = "Devices (" + lastDevCount + "): " +
+                    (lastDevCount == 0 ? "-" : string.Join(", ", Devices.List.Select(d => d.Name).Distinct()));
+            }
+
             if (learn != LearnMode.None) { DoLearn(); return; }
 
             foreach (var a in axes.ToList())
             {
-                if (!Joy.Read(a.Joy, out var j)) { a.Live = "n/a"; continue; }
-                double v = (Joy.GetAxis(j, a.Axis) - 32767.5) / 32767.5; // -1..1
+                var dev = Devices.Find(a.JoyName, a.Joy);
+                if (dev == null || !dev.Ok) { a.Live = "n/a"; continue; }
+                double v = (dev.Ax[Devices.AxisIndex(a.Axis)] - 32767.5) / 32767.5; // -1..1
                 if (a.Invert) v = -v;
                 if (Math.Abs(v) * 100 < a.Deadzone) v = 0;
                 a.Live = Math.Round(v * 100).ToString("0") + "%";
@@ -391,26 +331,25 @@ namespace AxisClone
                 }
             }
 
-            var joys = buttons.Select(x => x.Joy).Distinct().ToList();
-            var current = new Dictionary<int, uint>();
-            foreach (int id in joys)
-                if (Joy.Read(id, out var jj)) current[id] = jj.dwButtons;
-
-            foreach (var b in buttons.ToList())
+            foreach (var dev in Devices.List)
             {
-                if (!current.TryGetValue(b.Joy, out uint now32)) { b.State = "n/a"; continue; }
-                if (b.Button < 1 || b.Button > 32) continue;
-                lastButtons.TryGetValue(b.Joy, out uint prev);
-                uint mask = 1u << (b.Button - 1);
-                bool now = (now32 & mask) != 0, was = (prev & mask) != 0;
-                b.State = now ? "ON" : "";
-                if (sc == null) continue;
-                if (now && !was) Fire(b, true);
-                else if (!now && was) Fire(b, false);
+                if (!dev.Ok) continue;
+                if (!prevBtn.TryGetValue(dev.Guid, out bool[] prev)) { prev = new bool[Dev.BtnCount]; prevBtn[dev.Guid] = prev; }
+                for (int i = 0; i < Dev.BtnCount; i++)
+                {
+                    if (dev.Btn[i] == prev[i]) continue;
+                    prev[i] = dev.Btn[i];
+                    OnButtonEdge(dev, i + 1, dev.Btn[i]);
+                }
             }
-            foreach (var kv in current) lastButtons[kv.Key] = kv.Value;
 
-            if (++tick % 4 == 0) { gridA.Invalidate(); gridB.Invalidate(); }
+            foreach (var b in buttons)
+            {
+                var dev = Devices.Find(b.JoyName, b.Joy);
+                b.State = dev == null ? "n/a" : (b.Button >= 1 && b.Button <= Dev.BtnCount && dev.Btn[b.Button - 1] ? "ON" : "");
+            }
+
+            if (tick % 4 == 0) { gridA.Invalidate(); gridB.Invalidate(); }
         }
 
         // ----- Preset -----
@@ -429,7 +368,7 @@ namespace AxisClone
             {
                 using (var fs = File.OpenRead(path))
                     preset = (Preset)new DataContractJsonSerializer(typeof(Preset)).ReadObject(fs);
-                axes.Clear(); buttons.Clear(); lastAxis.Clear(); toggleState.Clear();
+                axes.Clear(); buttons.Clear(); lastAxis.Clear(); toggleState.Clear(); armed.Clear();
                 foreach (var a in preset.Axes) axes.Add(a);
                 foreach (var b in preset.Buttons) buttons.Add(b);
                 Text = "Axis Clone - " + preset.Name;
@@ -458,42 +397,44 @@ namespace AxisClone
         // ----- Learn: deteksi axis / tombol otomatis -----
         void StartLearn(LearnMode m)
         {
-            learn = m; learnBase.Clear();
+            Devices.Refresh();
+            learn = m; learnAx.Clear(); learnBtn.Clear();
             status.Text = m == LearnMode.Axis ? "LEARN: gerakkan sebuah axis..." : "LEARN: tekan sebuah tombol...";
         }
 
         void DoLearn()
         {
-            string[] names = { "X", "Y", "Z", "R", "U", "V" };
-            for (int id = 0; id < 16; id++)
+            foreach (var dev in Devices.List)
             {
-                if (!Joy.Read(id, out var j)) continue;
+                if (!dev.Ok) continue;
                 if (learn == LearnMode.Axis)
                 {
-                    foreach (var n in names)
+                    for (int i = 0; i < dev.Ax.Length; i++)
                     {
-                        string key = id + n;
-                        uint v = Joy.GetAxis(j, n);
-                        if (!learnBase.TryGetValue(key, out uint b0)) { learnBase[key] = v; continue; }
-                        if (Math.Abs((int)v - (int)b0) > 12000)
+                        string key = dev.Guid + ":" + i;
+                        if (!learnAx.TryGetValue(key, out int b0)) { learnAx[key] = dev.Ax[i]; continue; }
+                        if (Math.Abs(dev.Ax[i] - b0) > 12000)
                         {
-                            axes.Add(new AxisMap { Joy = id, Axis = n, SimEvent = "" });
+                            axes.Add(new AxisMap { JoyName = dev.Name, Joy = dev.Ordinal, Axis = Devices.AxisNames[i], SimEvent = "" });
                             FinishLearn(gridA); return;
                         }
                     }
                 }
                 else
                 {
-                    string key = id + "B";
-                    if (!learnBase.TryGetValue(key, out uint b0)) { learnBase[key] = j.dwButtons; continue; }
-                    uint pressed = j.dwButtons & ~b0;
-                    if (pressed != 0)
+                    if (!learnBtn.TryGetValue(dev.Guid, out bool[] bs))
                     {
-                        int bit = 0; while ((pressed & (1u << bit)) == 0) bit++;
-                        buttons.Add(new ButtonMap { Joy = id, Button = bit + 1, SimEvent = "" });
-                        FinishLearn(gridB); return;
+                        learnBtn[dev.Guid] = (bool[])dev.Btn.Clone(); continue;
                     }
-                    learnBase[key] = b0 & j.dwButtons; // tombol yang dilepas boleh terdeteksi lagi
+                    for (int i = 0; i < Dev.BtnCount; i++)
+                    {
+                        if (dev.Btn[i] && !bs[i])
+                        {
+                            buttons.Add(new ButtonMap { JoyName = dev.Name, Joy = dev.Ordinal, Button = i + 1, SimEvent = "" });
+                            FinishLearn(gridB); return;
+                        }
+                        bs[i] = bs[i] && dev.Btn[i]; // yang dilepas boleh terdeteksi lagi
+                    }
                 }
             }
         }
@@ -508,8 +449,8 @@ namespace AxisClone
                 if (r >= 0) { g.CurrentCell = g.Rows[r].Cells["SimEvent"]; g.Focus(); }
             }
             catch { }
-            // reset state tombol agar tidak langsung memicu aksi
-            lastButtons.Clear();
+            // samakan state agar tombol yang baru ditekan tidak langsung memicu aksi
+            foreach (var dev in Devices.List) prevBtn[dev.Guid] = (bool[])dev.Btn.Clone();
         }
 
         // ----- Autocomplete nama event -----
@@ -683,6 +624,50 @@ namespace AxisClone
                 SaveSettings();
                 if (!string.IsNullOrEmpty(currentTitle)) OnAircraftChanged(currentTitle);
             }
+        }
+
+        // ----- Import preset Lorby (.tmpl) -----
+        void ImportLorby()
+        {
+            using (var d = new OpenFileDialog { Filter = "Lorby template (*.tmpl;*.xml)|*.tmpl;*.xml|Semua file|*.*" })
+            {
+                if (d.ShowDialog() != DialogResult.OK) return;
+                try
+                {
+                    var r = LorbyImport.Import(d.FileName);
+                    preset = r.Preset;
+                    axes.Clear(); buttons.Clear(); lastAxis.Clear(); toggleState.Clear(); armed.Clear();
+                    foreach (var a in preset.Axes) axes.Add(a);
+                    foreach (var b in preset.Buttons) buttons.Add(b);
+                    Text = "Axis Clone - " + preset.Name + " (import Lorby)";
+                    txtMatch.Text = "";
+                    lastPresetPath = ""; SaveSettings();
+                    SyncToggles();
+                    ShowReport(string.Join(Environment.NewLine, r.Report));
+                }
+                catch (Exception ex) { MessageBox.Show("Gagal import: " + ex.Message); }
+            }
+        }
+
+        void ShowReport(string text)
+        {
+            using (var f = new Form { Text = "Hasil Import Lorby", Width = 760, Height = 540, StartPosition = FormStartPosition.CenterParent })
+            {
+                var tb = new TextBox
+                {
+                    Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false,
+                    Dock = DockStyle.Fill, Font = new Font("Consolas", 9f), Text = text
+                };
+                f.Controls.Add(tb);
+                tb.Select(0, 0);
+                f.ShowDialog(this);
+            }
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            Devices.Init(Handle);
         }
 
         [STAThread]
